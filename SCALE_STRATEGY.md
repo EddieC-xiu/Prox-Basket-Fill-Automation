@@ -48,17 +48,15 @@ This handles the vast majority of queries cheaply and reliably.  A bag of "bonel
 
 ---
 
-## How would you improve basket fill quality over time?
+1. **Let people tell you when you’re wrong** — add thumbs up / thumbs down (or “pick the right product”) on each line. Save that in something like a `match_feedback` table so you’re not guessing in the dark.
 
-1. **Feedback loop** — let users thumbs-up/down each match.  Store corrections in a `match_feedback` table.
+2. **Curated overrides for the repeat offenders** — if “milk” at a given store always maps to the wrong SKU, don’t keep fighting the scorer forever. Keep a small `query → product_id` table and update it by hand (or from support) when the same mistake shows up a lot.
 
-2. **Override dictionary** — high-volume queries where the default scorer is wrong get a hand-curated `query → preferred_product_id` override table, updated weekly.
+3. **Synonym / slang map** — users don’t type like the catalog. Build a dumb map over time (`nonfat` ≈ `fat free`, `whole wheat` ≈ `whole grain`) from real corrections so the tokenizer stops punishing normal language.
 
-3. **Synonym expansion** — build a query-normalisation map (`nonfat` → `fat free`, `whole wheat` → `whole grain`) derived from confirmed corrections.
+4. **Tune the weights with data** — `matcher.ts` already mixes token / brand / size / notes scores. Once you have feedback, run offline tests on old baskets and bump the weights that actually move precision (you don’t need a fancy name for it; A/B or grid search is fine).
 
-4. **A/B test scoring weights** — the four weights in `matcher.ts` are configurable.  Run weekly offline evaluations against the feedback corpus and promote weights that improve precision.
-
-5. **Seasonal catalogues** — re-warm the product cache for the top 500 queries every night via a cron job, so cache hits are warm at peak morning traffic.
+5. **Warm the cache overnight** — run a cron that pre-fetches the top ~500 searches (milk, eggs, bread…) before everyone wakes up. Then rush-hour traffic mostly hits cache and the matcher sees fresher candidates anyway.
 
 ---
 
