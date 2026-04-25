@@ -1,90 +1,95 @@
 # Scale & Cost Strategy
 
-## How would you avoid re-solving "milk" for the same retailer and ZIP 1,000 times?
-
-The system already caches at two levels:
-
-1. **SQLite product cache** (`product_cache` table) — keyed on `(retailer, location_id, query_key)` with a configurable TTL (default 1 hour).  The first request for `(kroger, 01400943, "milk")` hits the Kroger API; the next 999 are answered from the local database in microseconds.
-
-2. **Location cache** (`location_cache` table) — ZIP → store `locationId` never changes, so it's cached indefinitely.
-
-At production scale, the product cache moves from SQLite → **Redis** (or DynamoDB) shared across all worker instances, with a TTL of 4–8 hours.  Grocery assortments change infrequently; a stale price by a few cents is almost always acceptable.
+This is how we’d think about scaling the basket filler without pretending we already run it at Netflix size.
 
 ---
 
-## What parts of this system would be cached?
+## How would we avoid re-solving “milk” for the same retailer and ZIP a thousand times?
 
-| Layer | What | TTL |
-|---|---|---|
-| Location resolution | ZIP → Kroger `locationId` | indefinite (use ON CONFLICT update) |
-| Product search results | raw Kroger product JSON per query | 1–8 hours |
-| Match decisions | final basket match per `(query, location, brand, size, notes)` | 30–60 min |
-| Auth token | Kroger OAuth2 bearer token | 1 800 s (30 min TTL minus buffer) |
+We already cheat in a good way: **we remember stuff in SQLite.**
 
-Cached match decisions allow completely skipping the scoring step for repeat queries with identical parameters.
+1. **Product cache** — When we search Kroger for `"milk"` at a given store, we stash the raw results in a table keyed by retailer + store id + search text. First time = real API call. Next 999 times (within the TTL, default an hour) = we read from disk and move on. Same idea as “don’t keep googling the same question.”
 
----
+2. **Location cache** — ZIP → store id basically never needs to change for that ZIP, so we save it once and reuse it.
 
-## What would be deterministic vs AI-assisted?
-
-**Deterministic (current system):**
-- Token-based Jaccard similarity scoring
-- Brand/size/notes keyword matching
-- Location resolution and product search
-- Cache lookups and dedup
-
-This handles the vast majority of queries cheaply and reliably.  A bag of "boneless skinless chicken breast" from Kroger almost always maps correctly via keyword overlap.
-
-**AI-assisted (where worth the cost):**
-
-| Scenario | Why AI helps | When to invoke |
-|---|---|---|
-| Ambiguous categories | "ranch" → dressing vs. flavor chip | Only if deterministic score < 0.5 |
-| Spelling / brand aliases | "Haas avocado", "natty pb" | Pre-processing normalisation pass |
-| Semantic mismatches | "protein bar" → which category? | Low-confidence items only |
-| Substitution explanation | Generate natural-language rationale | On demand (user requests detail) |
-
-**Rule of thumb:** invoke AI only when the deterministic score falls below the substitute threshold (0.40) or when a human-readable explanation is explicitly requested.  At $0.002 per AI call and 10 items per basket, the all-AI cost per basket is $0.02.  With a 90% cache-hit rate, the actual blended cost is ~$0.002 per basket.
+If this ever grew into a real product with lots of servers, we’d move that “remembered search” layer to **one shared place** all boxes can read (instead of each server having its own tiny SQLite file). Same idea, bigger room. Prices don’t flip every second; being an hour behind is usually fine.
 
 ---
 
-1. **Let people tell you when you’re wrong** — add thumbs up / thumbs down (or “pick the right product”) on each line. Save that in something like a `match_feedback` table so you’re not guessing in the dark.
+## What would we actually cache?
 
-2. **Curated overrides for the repeat offenders** — if “milk” at a given store always maps to the wrong SKU, don’t keep fighting the scorer forever. Keep a small `query → product_id` table and update it by hand (or from support) when the same mistake shows up a lot.
+Rough picture:
 
-3. **Synonym / slang map** — users don’t type like the catalog. Build a dumb map over time (`nonfat` ≈ `fat free`, `whole wheat` ≈ `whole grain`) from real corrections so the tokenizer stops punishing normal language.
-
-4. **Tune the weights with data** — `matcher.ts` already mixes token / brand / size / notes scores. Once you have feedback, run offline tests on old baskets and bump the weights that actually move precision (you don’t need a fancy name for it; A/B or grid search is fine).
-
-5. **Warm the cache overnight** — run a cron that pre-fetches the top ~500 searches (milk, eggs, bread…) before everyone wakes up. Then rush-hour traffic mostly hits cache and the matcher sees fresher candidates anyway.
-
----
-
-## How would this scale to 5,000 concurrent users?
-
-| Component | Change |
-|---|---|
-| **Database** | Move from SQLite → PostgreSQL (or PlanetScale).  Add read replicas for history queries. |
-| **Cache** | Shared Redis cluster replaces in-process SQLite cache. |
-| **API workers** | Horizontally scale the Express service behind a load balancer (e.g. AWS ALB + ECS Fargate). |
-| **Search concurrency** | Per-request `p-limit(3)` becomes a global rate-limiter token bucket to cap total outbound Kroger API QPS across all workers. |
-| **Queue** | Replace synchronous fill with an async job queue (BullMQ + Redis).  POST /api/basket returns a job ID; the client polls `GET /api/jobs/:id` or uses a WebSocket. |
-| **CDN** | Product images and the static UI are served from CloudFront.  Zero origin load for assets. |
-
-At 5 000 users with an average basket of 10 items and a 90% cache hit rate, peak outbound Kroger API calls ≈ 5 000 × 10 × 0.10 = 5 000 req/s.  The Kroger public API allows ≈ 10 000 req/min per credential.  Solution: pool 2–3 API credential pairs and round-robin across them.
+| What | Why cache it | How long |
+|------|----------------|----------|
+| ZIP → store id | It’s stable | Basically forever (overwrite if it changes) |
+| Search results for `"milk"` at that store | Kroger charges calls / rate limits us | A few hours is plenty |
+| Final pick for same inputs | Skip scoring entirely on repeats | Maybe 30–60 min |
+| Login token for Kroger | Don’t re-auth every request | Until Kroger says it’s expired |
 
 ---
 
-## How would you control search / proxy / API costs?
+## What runs on plain code vs when we’d bother with AI?
 
-1. **Cache aggressively** — every product search is cached.  Most grocery items change price/availability less than once per day.  Extending TTL from 1 h → 8 h cuts Kroger API calls by 8×.
+**Plain code (what we ship now):**  
+word overlap, brand/size/notes checks, calling Kroger, reading cache, not hammering the API. Cheap, predictable, and honestly good enough for most groceries.
 
-2. **Batch queries** — the dedup logic in `basket.ts` already collapses identical queries within a single basket.  Across users, a shared cache provides the same benefit globally.
+**Where we might add AI later (only if it pays for itself):**  
+weird spelling, slang, stuff like “ranch” meaning dressing vs chips, or when the score is garbage and we’re about to pick something dumb. We would **not** run AI on every line — that’s burning money for no reason.
 
-3. **Pre-warm popular items** — top 1 000 queries (milk, eggs, bread, …) are refreshed nightly by a background job, so daytime traffic is nearly 100% cached.
+**Cost napkin math (made-up numbers, just for intuition):**  
+Say a cheap AI call is a couple tenths of a cent per item and a basket has 10 lines. If we went full-AI every time, that’s maybe a couple cents per basket. If **most** lookups hit cache or never need AI, the average cost per basket drops toward “basically nothing.” The point isn’t the exact cents — it’s **cache + rules first, AI only when we’re stuck.**
 
-4. **Tiered AI budget** — deterministic scoring is free.  AI is invoked only for low-confidence items (< 1% of queries in practice once the system matures).
+---
 
-5. **Circuit breaker** — if the Kroger API returns 429/503 repeatedly, fall back to returning the last cached result rather than hammering the endpoint and spending budget on retries.
+## How would we improve match quality over time?
 
-6. **Observability** — instrument cache hit rate per query key.  Queries with < 50% hit rate are candidates for extended TTL or pre-warming.
+We’d treat it like a class project that got real users: **ship, watch what breaks, patch the obvious stuff.**
+
+1. **Feedback** — thumbs up/down or “pick the right product” per line, saved in a simple feedback table. Otherwise we’re guessing.
+
+2. **Hand fixes for repeat mistakes** — if “milk” at store X always maps wrong, we add a tiny override table (`what they typed → product id we want`) instead of endlessly tuning math.
+
+3. **Synonym / slang map** — people don’t type like the catalog. Over time we’d grow a boring map (`nonfat` ≈ `fat free`, etc.) from real corrections.
+
+4. **Retune the matcher** — our weights in `matcher.ts` aren’t sacred. With saved baskets + feedback we’d try different mixes offline and keep whatever actually wins.
+
+5. **Nightly warm-up** — a scheduled job that pre-searches boring staples (milk, eggs, bread) before morning traffic so cache is already hot.
+
+---
+
+## How would this scale to ~5,000 people using it at once?
+
+We’re not there yet, but the story is straightforward:
+
+- **One database file won’t cut it** — we’d move history + cache to a proper hosted database so every server sees the same data.
+
+- **One server won’t cut it** — we’d run **multiple copies** of the app behind something that spreads traffic (think “load balancer 101”).
+
+- **One shared cache** — so all copies benefit from the same saved Kroger searches instead of each machine forgetting everything.
+
+- **Don’t block the browser forever** — heavy fills could become “submit job → poll until done” so a giant basket doesn’t tie up one worker for ages.
+
+- **Don’t re-download the UI from our tiny server for every image** — static pages and images could live on cheap file hosting so our app mostly does API + logic.
+
+Kroger’s public API has a **daily call cap** (order of tens of thousands per day per app). So we’d also **split traffic across a couple of registered apps** if we ever got huge, and we’d lean hard on cache so we don’t blow the limit in an hour.
+
+---
+
+## How would we keep search / API costs under control?
+
+1. **Cache longer when it’s safe** — groceries don’t need sub-minute freshness for everything. Longer TTL = fewer paid-ish API calls.
+
+2. **Dedup inside one basket** — we already search `"milk"` once if it appears twice; we’d keep doing that.
+
+3. **Pre-fetch popular stuff at night** — same as above; mornings feel faster and cheaper.
+
+4. **AI only on the weird rows** — rules do the heavy lifting.
+
+5. **Back off when Kroger is mad** — if we start getting rate-limit or server errors, we stop retrying like idiots and return the last good cached result when we can.
+
+6. **Actually look at numbers** — simple logging: how often does cache hit per search term? If something is always a miss, we either cache it longer or warm it on purpose.
+
+---
+
+That’s the gist: **cache what repeats, share state if we multiply servers, use AI sparingly, and improve from real user feedback instead of vibes.**
