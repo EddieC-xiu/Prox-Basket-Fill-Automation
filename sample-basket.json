@@ -1,0 +1,16 @@
+{
+  "retailer": "kroger",
+  "zip": "90046",
+  "items": [
+    { "query": "milk",           "size_preference": "1 gallon" },
+    { "query": "eggs",           "size_preference": "12 count" },
+    { "query": "avocados",       "notes": "organic if possible" },
+    { "query": "chicken breast", "notes": "boneless skinless" },
+    { "query": "tortilla chips" },
+    { "query": "greek yogurt",   "brand_preference": "Chobani" },
+    { "query": "peanut butter",  "size_preference": "16 oz" },
+    { "query": "bananas" },
+    { "query": "orange juice" },
+    { "query": "butter",         "size_preference": "16 oz" }
+  ]
+}
