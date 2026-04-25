@@ -1,10 +1,17 @@
 # Scale & Cost Strategy
 
-This is how we’d think about scaling the basket filler without pretending we already run it at Netflix size.
+One-page write-up for Track C, answering:
+
+- How would you avoid re-solving “milk” for the same retailer and ZIP 1,000 times?
+- What parts of this system would be cached?
+- What would be deterministic vs AI-assisted?
+- How would you improve basket fill quality over time?
+- How would this scale to 5,000 users?
+- How would you control search / proxy / API costs?
 
 ---
 
-## How would we avoid re-solving “milk” for the same retailer and ZIP a thousand times?
+## How would you avoid re-solving “milk” for the same retailer and ZIP 1,000 times?
 
 We already cheat in a good way: **we remember stuff in SQLite.**
 
@@ -16,7 +23,7 @@ If this ever grew into a real product with lots of servers, we’d move that “
 
 ---
 
-## What would we actually cache?
+## What parts of this system would be cached?
 
 Rough picture:
 
@@ -29,12 +36,12 @@ Rough picture:
 
 ---
 
-## What runs on plain code vs when we’d bother with AI?
+## What would be deterministic vs AI-assisted?
 
-**Plain code (what we ship now):**  
+**Deterministic (what we ship now):**  
 word overlap, brand/size/notes checks, calling Kroger, reading cache, not hammering the API. Cheap, predictable, and honestly good enough for most groceries.
 
-**Where we might add AI later (only if it pays for itself):**  
+**AI-assisted (only where it pays for itself):**  
 weird spelling, slang, stuff like “ranch” meaning dressing vs chips, or when the score is garbage and we’re about to pick something dumb. We would **not** run AI on every line — that’s burning money for no reason.
 
 **Cost napkin math (made-up numbers, just for intuition):**  
@@ -42,7 +49,7 @@ Say a cheap AI call is a couple tenths of a cent per item and a basket has 10 li
 
 ---
 
-## How would we improve match quality over time?
+## How would you improve basket fill quality over time?
 
 We’d treat it like a class project that got real users: **ship, watch what breaks, patch the obvious stuff.**
 
@@ -58,7 +65,7 @@ We’d treat it like a class project that got real users: **ship, watch what bre
 
 ---
 
-## How would this scale to ~5,000 people using it at once?
+## How would this scale to 5,000 users?
 
 We’re not there yet, but the story is straightforward:
 
@@ -76,9 +83,11 @@ Kroger’s public API has a **daily call cap** (order of tens of thousands per d
 
 ---
 
-## How would we keep search / API costs under control?
+## How would you control search / proxy / API costs?
 
-1. **Cache longer when it’s safe** — groceries don’t need sub-minute freshness for everything. Longer TTL = fewer paid-ish API calls.
+We’re not using a paid proxy right now — it’s straight to Kroger — so “cost” here is mostly **API calls, rate limits, and optional AI**.
+
+1. **Cache longer when it’s safe** — groceries don’t need sub-minute freshness for everything. Longer TTL = fewer API calls.
 
 2. **Dedup inside one basket** — we already search `"milk"` once if it appears twice; we’d keep doing that.
 
@@ -90,6 +99,8 @@ Kroger’s public API has a **daily call cap** (order of tens of thousands per d
 
 6. **Actually look at numbers** — simple logging: how often does cache hit per search term? If something is always a miss, we either cache it longer or warm it on purpose.
 
+If we ever added a proxy (e.g. to scrape something without an API), we’d rate-limit that too and cache hard so we’re not paying per request on the same “milk” search all day.
+
 ---
 
-That’s the gist: **cache what repeats, share state if we multiply servers, use AI sparingly, and improve from real user feedback instead of vibes.**
+**TL;DR:** cache what repeats, share state if we multiply servers, use AI sparingly, and improve from real user feedback instead of vibes.
