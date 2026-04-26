@@ -67,40 +67,36 @@ We’d treat it like a class project that got real users: **ship, watch what bre
 
 ## How would this scale to 5,000 users?
 
-We’re not there yet, but the story is straightforward:
+At that point we stop treating this like a single-laptop app and make a few practical changes:
 
-- **One database file won’t cut it** — we’d move history + cache to a proper hosted database so every server sees the same data.
+- **Shared database (not one local file)** — we can store basket history and caches in one hosted database so every app server sees the same data.
 
-- **One server won’t cut it** — we’d run **multiple copies** of the app behind something that spreads traffic (think “load balancer 101”).
+- **Multiple app servers** — we can run multiple copies of the API at the same time and put something in front to spread requests across them.
 
-- **One shared cache** — so all copies benefit from the same saved Kroger searches instead of each machine forgetting everything.
+- **Shared cache** — we can keep one shared cache for common searches (milk, eggs, etc.) so every server benefits from cache hits.
 
-- **Don’t block the browser forever** — heavy fills could become “submit job → poll until done” so a giant basket doesn’t tie up one worker for ages.
+- **Async basket filling for heavy loads** — we can return a “job id” right away and let the browser poll for results, instead of making one request wait forever.
 
-- **Don’t re-download the UI from our tiny server for every image** — static pages and images could live on cheap file hosting so our app mostly does API + logic.
+- **Static hosting for the UI** — we can serve the HTML/CSS/JS and images from simple static hosting so the API servers focus on calls + matching.
 
-Kroger’s public API has a **daily call cap** (order of tens of thousands per day per app). So we’d also **split traffic across a couple of registered apps** if we ever got huge, and we’d lean hard on cache so we don’t blow the limit in an hour.
+Also, Kroger’s public API has a **daily call cap**. So we rely on caching hard, and if traffic grows beyond one credential’s daily limit, we can register a couple of apps and spread traffic across them.
 
 ---
 
 ## How would you control search / proxy / API costs?
 
-We’re not using a paid proxy right now — it’s straight to Kroger — so “cost” here is mostly **API calls, rate limits, and optional AI**.
+Right now we call Kroger directly (no proxy), so the main “cost” is **API call limits** and keeping latency reasonable.
 
-1. **Cache longer when it’s safe** — groceries don’t need sub-minute freshness for everything. Longer TTL = fewer API calls.
+1. **Cache results** — cache common searches (milk, eggs, bread) for a while so we don’t re-hit the API for the same query over and over.
 
-2. **Dedup inside one basket** — we already search `"milk"` once if it appears twice; we’d keep doing that.
+2. **Deduplicate within a basket** — if the same query appears multiple times in one list, we only search once and reuse the result.
 
-3. **Pre-fetch popular stuff at night** — same as above; mornings feel faster and cheaper.
+3. **Warm the cache** — refresh the top items on a schedule so peak hours mostly hit cache instead of the API.
 
-4. **AI only on the weird rows** — rules do the heavy lifting.
+4. **Keep matching mostly deterministic** — use the rule-based scorer for most items. If we ever add an AI step, we only use it when the normal scorer is low-confidence.
 
-5. **Back off when Kroger is mad** — if we start getting rate-limit or server errors, we stop retrying like idiots and return the last good cached result when we can.
+5. **Handle rate limits cleanly** — if Kroger starts rate-limiting us or returning temporary errors, we slow down retries and prefer returning the last cached result when available.
 
-6. **Actually look at numbers** — simple logging: how often does cache hit per search term? If something is always a miss, we either cache it longer or warm it on purpose.
+6. **Track basic metrics** — log cache hit rate and API error rate. If a query is always a miss, we can cache it longer or warm it on purpose.
 
-If we ever added a proxy (e.g. to scrape something without an API), we’d rate-limit that too and cache hard so we’re not paying per request on the same “milk” search all day.
-
----
-
-**TL;DR:** cache what repeats, share state if we multiply servers, use AI sparingly, and improve from real user feedback instead of vibes.
+If we ever added a proxy (for a retailer without an official API), we’d treat it the same way: rate-limit it and cache aggressively to avoid paying repeatedly for the same searches.
